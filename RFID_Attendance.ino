@@ -1,20 +1,24 @@
 #include <SPI.h>
 #include <MFRC522.h>
+#include <BluetoothSerial.h>
 
 // ===================== PIN CONFIG =====================
-#define SS_PIN    21
-#define RST_PIN   4
-#define SCK_PIN   18
-#define MISO_PIN  19
-#define MOSI_PIN  23
+#define SS_PIN     21
+#define RST_PIN    4
+#define SCK_PIN    18
+#define MISO_PIN   19
+#define MOSI_PIN   23
 #define BUZZER_PIN 25
 
 MFRC522 rfid(SS_PIN, RST_PIN);
+BluetoothSerial BT;
 
 // ===================== SETTINGS =====================
-const unsigned long SCAN_COOLDOWN  = 2000;   // Anti-spam: min ms between any scans
-const unsigned long MIN_CHECKOUT   = 10000;  // ⬅ Minimum ms between TIME IN and TIME OUT (change this)
+const unsigned long SCAN_COOLDOWN = 2000;
+const unsigned long MIN_CHECKOUT  = 10000;  // ⬅ Change this (ms)
 const int MAX_CARDS = 5;
+
+#define BT_DEVICE_NAME "RFID-Attendance"  // ⬅ Name that shows up when pairing
 
 // ===================== CARD STATE =====================
 struct CardRecord {
@@ -22,11 +26,28 @@ struct CardRecord {
   byte uidSize;
   bool isCheckedIn;
   unsigned long timeInMs;
-  bool active;  // true = this slot is occupied
+  bool active;
 };
 
 CardRecord cards[MAX_CARDS];
 unsigned long lastScanTime = 0;
+
+// ===================== DUAL OUTPUT =====================
+// Writes to both Serial and Bluetooth simultaneously
+void dualPrint(String msg) {
+  Serial.print(msg);
+  if (BT.connected()) BT.print(msg);
+}
+
+void dualPrintln(String msg) {
+  Serial.println(msg);
+  if (BT.connected()) BT.println(msg);
+}
+
+void dualPrintln() {
+  Serial.println();
+  if (BT.connected()) BT.println();
+}
 
 // ===================== HELPERS =====================
 bool uidMatch(byte *a, byte sizeA, byte *b, byte sizeB) {
@@ -37,20 +58,22 @@ bool uidMatch(byte *a, byte sizeA, byte *b, byte sizeB) {
   return true;
 }
 
-void printUID(byte *uid, byte size) {
+void dualPrintUID(byte *uid, byte size) {
+  String out = "";
   for (byte i = 0; i < size; i++) {
-    if (uid[i] < 0x10) Serial.print("0");
-    Serial.print(uid[i], HEX);
-    if (i < size - 1) Serial.print(":");
+    if (uid[i] < 0x10) out += "0";
+    out += String(uid[i], HEX);
+    if (i < size - 1) out += ":";
   }
+  out.toUpperCase();
+  dualPrint(out);
 }
 
-// Format milliseconds -> "Xh Ym Zs"
 String formatDuration(unsigned long ms) {
   unsigned long totalSec = ms / 1000;
-  unsigned long hours    = totalSec / 3600;
-  unsigned long minutes  = (totalSec % 3600) / 60;
-  unsigned long seconds  = totalSec % 60;
+  unsigned long hours   = totalSec / 3600;
+  unsigned long minutes = (totalSec % 3600) / 60;
+  unsigned long seconds = totalSec % 60;
 
   String result = "";
   if (hours > 0)   result += String(hours)   + "h ";
@@ -59,7 +82,6 @@ String formatDuration(unsigned long ms) {
   return result;
 }
 
-// Format raw ms timestamp -> "HH:MM:SS (Xms)"
 String formatTimestamp(unsigned long ms) {
   unsigned long totalSec = ms / 1000;
   unsigned long hh = totalSec / 3600;
@@ -78,24 +100,16 @@ void beep(int duration) {
   digitalWrite(BUZZER_PIN, LOW);
 }
 
-void beepSuccess() {  // Two short beeps = TIME IN
-  beep(150); delay(80); beep(150);
-}
-
-void beepCheckout() { // One long beep = TIME OUT
-  beep(600);
-}
-
-void beepRejected() { // Three rapid beeps = too soon
-  beep(80); delay(60); beep(80); delay(60); beep(80);
-}
+void beepSuccess()  { beep(150); delay(80); beep(150); }  // Time In
+void beepCheckout() { beep(600); }                         // Time Out
+void beepRejected() { beep(80); delay(60); beep(80); delay(60); beep(80); } // Too soon
+void beepBTConn()   { beep(100); delay(50); beep(100); delay(50); beep(300); } // BT connected
 
 // ===================== CARD LOOKUP / REGISTER =====================
 int findCard(byte *uid, byte size) {
   for (int i = 0; i < MAX_CARDS; i++) {
-    if (cards[i].active && uidMatch(cards[i].uid, cards[i].uidSize, uid, size)) {
+    if (cards[i].active && uidMatch(cards[i].uid, cards[i].uidSize, uid, size))
       return i;
-    }
   }
   return -1;
 }
@@ -104,30 +118,69 @@ int registerCard(byte *uid, byte size) {
   for (int i = 0; i < MAX_CARDS; i++) {
     if (!cards[i].active) {
       memcpy(cards[i].uid, uid, size);
-      cards[i].uidSize    = size;
+      cards[i].uidSize     = size;
       cards[i].isCheckedIn = false;
-      cards[i].timeInMs   = 0;
-      cards[i].active     = true;
+      cards[i].timeInMs    = 0;
+      cards[i].active      = true;
       return i;
     }
   }
-  return -1;  // No free slots
+  return -1;
+}
+
+// ===================== BT COMMAND HANDLER =====================
+// Allows the connected device to send simple commands over BT
+void handleBTCommand(String cmd) {
+  cmd.trim();
+  cmd.toUpperCase();
+
+  if (cmd == "STATUS") {
+    dualPrintln("=== CURRENT STATUS ===");
+    bool anyActive = false;
+    for (int i = 0; i < MAX_CARDS; i++) {
+      if (cards[i].active) {
+        anyActive = true;
+        dualPrint("Slot " + String(i) + " | UID: ");
+        dualPrintUID(cards[i].uid, cards[i].uidSize);
+        if (cards[i].isCheckedIn) {
+          unsigned long elapsed = millis() - cards[i].timeInMs;
+          dualPrintln(" | IN  | Duration so far: " + formatDuration(elapsed));
+        } else {
+          dualPrintln(" | OUT");
+        }
+      }
+    }
+    if (!anyActive) dualPrintln("No cards registered yet.");
+    dualPrintln("======================");
+
+  } else if (cmd == "HELP") {
+    dualPrintln("=== BT COMMANDS ===");
+    dualPrintln("STATUS  - Show all registered cards and their state");
+    dualPrintln("CLEAR   - Clear all card records");
+    dualPrintln("HELP    - Show this message");
+    dualPrintln("===================");
+
+  } else if (cmd == "CLEAR") {
+    memset(cards, 0, sizeof(cards));
+    dualPrintln(">> All card records cleared.");
+
+  } else {
+    dualPrintln("Unknown command: " + cmd + " (type HELP for commands)");
+  }
 }
 
 // ===================== ATTENDANCE LOGIC =====================
 void handleCard(byte *uid, byte size) {
   int idx = findCard(uid, size);
 
-  // First time seeing this card — register it
   if (idx == -1) {
     idx = registerCard(uid, size);
     if (idx == -1) {
-      Serial.println("!! Card registry full. Cannot register new card.");
+      dualPrintln("!! Registry full. Cannot register new card.");
       beepRejected();
       return;
     }
-    Serial.print(">> New card registered in slot ");
-    Serial.println(idx);
+    dualPrintln(">> New card registered in slot " + String(idx));
   }
 
   CardRecord &card = cards[idx];
@@ -137,32 +190,32 @@ void handleCard(byte *uid, byte size) {
     card.isCheckedIn = true;
     card.timeInMs    = millis();
 
-    Serial.println(">>> TIME IN");
-    Serial.print("    UID      : "); printUID(uid, size); Serial.println();
-    Serial.print("    Time In  : "); Serial.println(formatTimestamp(card.timeInMs));
+    dualPrintln(">>> TIME IN");
+    dualPrint  ("    UID     : "); dualPrintUID(uid, size); dualPrintln();
+    dualPrintln("    Time In : " + formatTimestamp(card.timeInMs));
     beepSuccess();
   }
 
-  // ---- TIME OUT (cooldown check) ----
+  // ---- TIME OUT ----
   else {
     unsigned long elapsed = millis() - card.timeInMs;
 
     if (elapsed < MIN_CHECKOUT) {
       unsigned long remaining = (MIN_CHECKOUT - elapsed) / 1000;
-      Serial.println(">>> TOO SOON — Cannot check out yet.");
-      Serial.print("    Wait another ~"); Serial.print(remaining); Serial.println("s");
+      dualPrintln(">>> TOO SOON — Cannot check out yet.");
+      dualPrintln("    Wait another ~" + String(remaining) + "s");
       beepRejected();
       return;
     }
 
-    unsigned long timeOutMs = millis();
+    unsigned long timeOutMs  = millis();
     card.isCheckedIn = false;
 
-    Serial.println(">>> TIME OUT");
-    Serial.print("    UID        : "); printUID(uid, size); Serial.println();
-    Serial.print("    Time In    : "); Serial.println(formatTimestamp(card.timeInMs));
-    Serial.print("    Time Out   : "); Serial.println(formatTimestamp(timeOutMs));
-    Serial.print("    Duration   : "); Serial.println(formatDuration(elapsed));
+    dualPrintln(">>> TIME OUT");
+    dualPrint  ("    UID      : "); dualPrintUID(uid, size); dualPrintln();
+    dualPrintln("    Time In  : " + formatTimestamp(card.timeInMs));
+    dualPrintln("    Time Out : " + formatTimestamp(timeOutMs));
+    dualPrintln("    Duration : " + formatDuration(elapsed));
     beepCheckout();
   }
 }
@@ -180,10 +233,13 @@ void setup() {
 
   memset(cards, 0, sizeof(cards));
 
+  // Start Bluetooth
+  BT.begin(BT_DEVICE_NAME);
+
   Serial.println("========================================");
   Serial.println("   RFID Attendance System Ready");
-  Serial.print  ("   Min checkout time: ");
-  Serial.println(formatDuration(MIN_CHECKOUT));
+  Serial.println("   Bluetooth: " + String(BT_DEVICE_NAME));
+  Serial.println("   Min checkout time: " + formatDuration(MIN_CHECKOUT));
   Serial.println("========================================");
 
   beep(1000);
@@ -191,6 +247,24 @@ void setup() {
 
 // ===================== LOOP =====================
 void loop() {
+
+  // Handle incoming BT commands
+  if (BT.connected()) {
+    static String btBuffer = "";
+    while (BT.available()) {
+      char c = BT.read();
+      if (c == '\n' || c == '\r') {
+        if (btBuffer.length() > 0) {
+          handleBTCommand(btBuffer);
+          btBuffer = "";
+        }
+      } else {
+        btBuffer += c;
+      }
+    }
+  }
+
+  // Anti-spam cooldown
   if (millis() - lastScanTime < SCAN_COOLDOWN) return;
 
   if (!rfid.PICC_IsNewCardPresent()) return;
@@ -198,9 +272,9 @@ void loop() {
 
   lastScanTime = millis();
 
-  Serial.println("----------------------------------------");
+  dualPrintln("----------------------------------------");
   handleCard(rfid.uid.uidByte, rfid.uid.size);
-  Serial.println("----------------------------------------");
+  dualPrintln("----------------------------------------");
 
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
